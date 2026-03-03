@@ -12,7 +12,7 @@ if multiprocessing.get_start_method() != "spawn":
     multiprocessing.set_start_method("spawn", force=True)
 import argparse
 import signal
-
+import re
 
 from isaaclab.app import AppLauncher
 
@@ -87,130 +87,39 @@ import time
 
 import gymnasium as gym
 import torch
+import numpy as np
 from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv
 from isaaclab.managers import DatasetExportMode, TerminationTermCfg
 from isaaclab_tasks.utils import parse_env_cfg
 from leisaac.enhance.managers import EnhanceDatasetExportMode, StreamingRecorderManager
 from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
+from utils.point_clouds import sample_mesh_points_global, transform_points, save_pointclouds
 
-import re
-import numpy as np
+from omni.usd import get_context
 from pxr import Usd, UsdGeom, Gf
-import omni.usd
 
-def sample_points_on_triangles(V, F, n):
-    """
-    V: (Nv, 3) vertices
-    F: (Nf, 3) triangle indices
-    n: number of points
-    returns: (n, 3) sampled points in the same frame as V
-    """
-    v0 = V[F[:, 0]]
-    v1 = V[F[:, 1]]
-    v2 = V[F[:, 2]]
-
-    # triangle areas
-    cross = np.cross(v1 - v0, v2 - v0)
-    area = 0.5 * np.linalg.norm(cross, axis=1)
-    area = np.maximum(area, 1e-12)
-
-    # choose triangles proportional to area
-    p = area / area.sum()
-    tri_idx = np.random.choice(len(F), size=n, p=p)
-
-    a = v0[tri_idx]
-    b = v1[tri_idx]
-    c = v2[tri_idx]
-
-    # barycentric sampling (uniform on triangle)
-    u = np.random.rand(n, 1)
-    v = np.random.rand(n, 1)
-    # fold to keep u+v <= 1
-    mask = (u + v) > 1.0
-    u[mask] = 1.0 - u[mask]
-    v[mask] = 1.0 - v[mask]
-
-    pts = a + u * (b - a) + v * (c - a)
-    return pts
-
-def _triangulate(faceVertexCounts, faceVertexIndices):
-    """Triangulate polygon faces into triangles (fan triangulation)."""
-    tris = []
-    idx = 0
-    for c in faceVertexCounts:
-        face = faceVertexIndices[idx: idx + c]
-        idx += c
-        if c < 3:
-            continue
-        # fan: (0, i, i+1)
-        for i in range(1, c - 1):
-            tris.append([face[0], face[i], face[i + 1]])
-    return np.asarray(tris, dtype=np.int64)
-
-def quat_wxyz_to_rotmat(q):
-    w, x, y, z = q
-    return np.array([
-        [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-        [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)],
-    ], dtype=np.float64)
-
-def transform_points(pts_local, pos_w, quat_wxyz):
-    R = quat_wxyz_to_rotmat(quat_wxyz)
-    return (pts_local @ R.T) + pos_w[None, :]
-
-def sample_mesh_points_local(mesh_prim_path: str, n: int, time_code=None) -> np.ndarray:
-    stage = omni.usd.get_context().get_stage()
-    prim = stage.GetPrimAtPath(mesh_prim_path)
-    if not prim.IsValid():
-        raise ValueError(f"Invalid prim path: {mesh_prim_path}")
-
-    mesh = UsdGeom.Mesh(prim)
-    if not mesh:
-        raise TypeError(f"Prim at {mesh_prim_path} is not a UsdGeom.Mesh")
-
-    tc = Usd.TimeCode.Default() if time_code is None else time_code
-
-    V = np.asarray(mesh.GetPointsAttr().Get(tc), dtype=np.float64)
-    counts = mesh.GetFaceVertexCountsAttr().Get(tc)
-    indices = mesh.GetFaceVertexIndicesAttr().Get(tc)
-    F = _triangulate(counts, indices)          # uses your triangulate helper
-    pts_local = sample_points_on_triangles(V, F, n) # uses your barycentric sampler
-    return pts_local
-
-def rigid_object_pc(env):
+def rigid_object_pc(env, object_names):
     env_id = 0
 
-    obj = env.scene["Orange001"]
-    pos = obj.data.root_pos_w[0].cpu().numpy()
-    quat = obj.data.root_quat_w[0].cpu().numpy()
+    pcd = None
 
-    prim_path = env.scene['Orange001'].cfg.prim_path
-    actual_prim_path = re.sub(r"env_\.\*/", f"env_{env_id}/", prim_path)
-    mesh_path = actual_prim_path + "/Collisions/Orange001_C"
-    pts_l = sample_mesh_points_local(mesh_path, n=2048)
-    pts_w = transform_points(pts_l, pos, quat)
+    for object_name in object_names:
+        obj = env.scene[object_name]
+        pos = obj.data.root_pos_w[0].cpu().numpy()
+        quat = obj.data.root_quat_w[0].cpu().numpy()
 
-    mn = np.asarray(pts_w).min(0)
-    mx = np.asarray(pts_w).max(0)
+        prim_path = obj.cfg.prim_path
+        actual_prim_path = re.sub(r"env_\.\*/", f"env_{env_id}/", prim_path)
+        mesh_path = actual_prim_path + f"/Collisions/{object_name}_C"
 
-    print("pos", pos, "quat(wxyz)", quat, "bbox", mn, mx)
-    return pts_w
+        pts_w = sample_mesh_points_global(mesh_path, n=500, pos=pos, quat=quat)
 
-def save_pointclouds(pointcloud_list, filename="datasets/pointclouds.npz"):
-    """
-    pointcloud_list: list of (N,3) numpy arrays
-    """
-    # Convert torch tensors if needed
-    pcs = []
-    for pc in pointcloud_list:
-        if hasattr(pc, "detach"):  # torch tensor
-            pc = pc.detach().cpu().numpy()
-        pcs.append(pc)
+        if pcd is None:
+            pcd = pts_w
+        else:
+            pcd = np.vstack([pcd, pts_w])
 
-    # Save as numbered arrays
-    np.savez_compressed(filename, *pcs)
-    print(f"Saved {len(pcs)} point clouds to {filename}")
+    return pcd
 
 class RateLimiter:
     """Convenience class for enforcing rates in loops."""
@@ -487,7 +396,8 @@ def main():  # noqa: C901
                         if args_cli.record:
                             print("Start Recording!!!")
                         start_record_state = True
-                    pc = rigid_object_pc(env)
+                    pc = rigid_object_pc(env, ['Orange001', 'Orange002', 'Orange003', 'Plate'])
+                    #pc = rigid_object_pc(env, ['Orange001', 'Orange002', 'Orange003'])
                     pcs.append(pc)
                     env.step(actions)
                 if rate_limiter:
