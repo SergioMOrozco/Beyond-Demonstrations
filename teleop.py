@@ -425,5 +425,5 @@ def main():  # noqa: C901
 
 
 if __name__ == "__main__":
-    # run the main function
+    # example: python teleop.py     --task=LeIsaac-SO101-PickOrange-v0     --teleop_device=so101leader     --port=/dev/ttyACM0     --num_envs=1     --device=cuda     --enable_cameras 
     main()
