@@ -1,6 +1,7 @@
 import numpy as np
 from pxr import Usd, UsdGeom, Gf
 import omni.usd
+import re
 
 def apply_gf_matrix4d(points, gf_mat4):
     # points: (N,3)
@@ -112,3 +113,26 @@ def save_pointclouds(pointcloud_list, filename="datasets/pointclouds.npz"):
     # Save as numbered arrays
     np.savez_compressed(filename, *pcs)
     print(f"Saved {len(pcs)} point clouds to {filename}")
+
+def rigid_object_pc(env, object_names, n_points=500):
+    env_id = 0
+
+    pcd = None
+
+    for object_name in object_names:
+        obj = env.scene[object_name]
+        pos = obj.data.root_pos_w[0].cpu().numpy()
+        quat = obj.data.root_quat_w[0].cpu().numpy()
+
+        prim_path = obj.cfg.prim_path
+        actual_prim_path = re.sub(r"env_\.\*/", f"env_{env_id}/", prim_path)
+        mesh_path = actual_prim_path + f"/Collisions/{object_name}_C"
+
+        pts_w = sample_mesh_points_global(mesh_path, n=n_points, pos=pos, quat=quat)
+
+        if pcd is None:
+            pcd = pts_w
+        else:
+            pcd = np.vstack([pcd, pts_w])
+
+    return pcd

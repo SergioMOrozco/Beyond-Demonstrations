@@ -12,7 +12,6 @@ if multiprocessing.get_start_method() != "spawn":
     multiprocessing.set_start_method("spawn", force=True)
 import argparse
 import signal
-import re
 
 from isaaclab.app import AppLauncher
 
@@ -93,33 +92,13 @@ from isaaclab.managers import DatasetExportMode, TerminationTermCfg
 from isaaclab_tasks.utils import parse_env_cfg
 from leisaac.enhance.managers import EnhanceDatasetExportMode, StreamingRecorderManager
 from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
-from utils.point_clouds import sample_mesh_points_global, transform_points, save_pointclouds
+from utils.point_clouds import sample_mesh_points_global, transform_points, save_pointclouds, rigid_object_pc
+from utils.grasps import topdown_antipodal_grasps
+from utils.ik import solve_ik_frame, load_chain
 
 from omni.usd import get_context
 from pxr import Usd, UsdGeom, Gf
 
-def rigid_object_pc(env, object_names):
-    env_id = 0
-
-    pcd = None
-
-    for object_name in object_names:
-        obj = env.scene[object_name]
-        pos = obj.data.root_pos_w[0].cpu().numpy()
-        quat = obj.data.root_quat_w[0].cpu().numpy()
-
-        prim_path = obj.cfg.prim_path
-        actual_prim_path = re.sub(r"env_\.\*/", f"env_{env_id}/", prim_path)
-        mesh_path = actual_prim_path + f"/Collisions/{object_name}_C"
-
-        pts_w = sample_mesh_points_global(mesh_path, n=500, pos=pos, quat=quat)
-
-        if pcd is None:
-            pcd = pts_w
-        else:
-            pcd = np.vstack([pcd, pts_w])
-
-    return pcd
 
 class RateLimiter:
     """Convenience class for enforcing rates in loops."""
@@ -348,6 +327,8 @@ def main():  # noqa: C901
 
     pcs = []
 
+    chain = load_chain()
+
     try:
         while simulation_app.is_running() and not interrupted:
             # run everything in inference mode
@@ -396,9 +377,55 @@ def main():  # noqa: C901
                         if args_cli.record:
                             print("Start Recording!!!")
                         start_record_state = True
-                    pc = rigid_object_pc(env, ['Orange001', 'Orange002', 'Orange003', 'Plate'])
-                    #pc = rigid_object_pc(env, ['Orange001', 'Orange002', 'Orange003'])
+                    pc = rigid_object_pc(env, ['Orange001'])
                     pcs.append(pc)
+
+                    grasps = topdown_antipodal_grasps(
+                    pc,
+                    n_candidates=30,
+                    sample_pairs=8000,
+                        min_width=0.015,
+                        max_width=0.080,
+                        approach_clearance=0.08,
+                        finger_depth=0.05,
+                        seed=0,
+                    )
+
+                    if len(grasps) > 0:
+                        g0 = grasps[0]
+                        print(
+                            f"[GRASP] score={g0['score']:.3f} width={g0['width']:.3f} "
+                            f"pos={g0['pos']} quat(xyzw)={g0['quat']}"
+                        )
+
+
+                        # assuming 1 env
+                        q_init = env.scene['robot'].data.joint_pos.detach().cpu().numpy()[0]
+                        q_init = np.concatenate([[0.0], q_init]) # need a leading dummy joint
+
+                        g = grasps[0]
+
+                        q_pre = solve_ik_frame(chain, g["pregrasp"], g["quat"], q_init)
+                        q_grasp = solve_ik_frame(chain, g["pos"], g["quat"], q_pre)
+                        q_lift = solve_ik_frame(
+                            chain,
+                            np.asarray(g["pos"]) + np.array([0.0, 0.0, 0.10]),
+                            g["quat"],
+                            q_grasp,
+                        )
+
+                        for _ in range(40):
+                            action = torch.tensor(q_pre[1:]).unsqueeze(0)
+                            env.step(action)
+
+                        for _ in range(40):
+                            action = torch.tensor(q_grasp[1:]).unsqueeze(0)
+                            env.step(action)
+
+                        for _ in range(40):
+                            action = torch.tensor(q_lift[1:]).unsqueeze(0)
+                            env.step(action)
+
                     env.step(actions)
                 if rate_limiter:
                     rate_limiter.sleep(env)
