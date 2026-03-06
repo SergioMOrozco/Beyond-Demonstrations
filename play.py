@@ -95,6 +95,8 @@ from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
 from utils.point_clouds import sample_mesh_points_global, transform_points, save_pointclouds, rigid_object_pc
 from utils.grasps import topdown_antipodal_grasps
 from utils.ik import solve_ik_frame, load_chain, run_ik_to_pose, hold_current_joints
+from isaaclab.markers.config import FRAME_MARKER_CFG
+from isaaclab.markers import VisualizationMarkers
 
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.managers import SceneEntityCfg
@@ -248,79 +250,167 @@ def main():  # noqa: C901
 
     pcs = []
 
-    ee_pose_w = robot.data.body_pose_w[:, robot_entity_cfg.body_ids[0]]
-    pre_pos_w = ee_pose_w[:, 0:3].clone()
-    grasp_quat_w = ee_pose_w[:, 3:7].clone()
+    count = 0
+    sim_dt = env.sim.get_physics_dt()
+
+    # Markers
+    frame_marker_cfg = FRAME_MARKER_CFG.copy()
+    frame_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
+    ee_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_current"))
+    goal_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_goal"))
+
+    # Define goals for the arm
+    ee_goals = [
+        [0.5, 0.5, 0.7, 0.707, 0, 0.707, 0],
+        [0.5, -0.4, 0.6, 0.707, 0.707, 0.0, 0.0],
+        [0.5, 0, 0.5, 0.0, 1.0, 0.0, 0.0],
+    ]
+    ee_goals = torch.tensor(ee_goals, device=env.sim.device)
+    # Track the given command
+    current_goal_idx = 0
+    # Create buffers to store actions
+    ik_commands = torch.zeros(env.num_envs, diff_ik.action_dim, device=robot.device)
+    ik_commands[:] = ee_goals[current_goal_idx]
 
     try:
-        while simulation_app.is_running() and not interrupted:
-            # run everything in inference mode
-            with torch.inference_mode():
 
-                #pc = rigid_object_pc(env, ['Orange001'])
-                #pcs.append(pc)
-
-                #grasps = topdown_antipodal_grasps(
-                #pc,
-                #n_candidates=30,
-                #sample_pairs=8000,
-                #    min_width=0.015,
-                #    max_width=0.080,
-                #    approach_clearance=0.08,
-                #    finger_depth=0.05,
-                #    seed=0,
-                #)
-
-                #hold_current_joints(env, robot, robot_entity_cfg, steps=40)
-
+         while simulation_app.is_running():
+            # reset
+            if count % 150 == 0:
+                # reset time
+                count = 0
+                # reset joint state
+                joint_pos = robot.data.default_joint_pos.clone()
+                joint_vel = robot.data.default_joint_vel.clone()
+                robot.write_joint_state_to_sim(joint_pos, joint_vel)
+                robot.reset()
+                # reset actions
+                ik_commands[:] = ee_goals[current_goal_idx]
+                joint_pos_des = joint_pos[:, robot_entity_cfg.joint_ids].clone()
+                # reset controller
                 diff_ik.reset()
-
-                run_ik_to_pose(
-                    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
-                    pre_pos_w, grasp_quat_w, steps=40
+                diff_ik.set_command(ik_commands)
+            
+                # change goal
+                current_goal_idx = (current_goal_idx + 1) % len(ee_goals)
+            else:
+                # obtain quantities from simulation
+                jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, robot_entity_cfg.joint_ids]
+                ee_pose_w = robot.data.body_pose_w[:, robot_entity_cfg.body_ids[0]]
+                root_pose_w = robot.data.root_pose_w
+                joint_pos = robot.data.joint_pos[:, robot_entity_cfg.joint_ids]
+                # compute frame in root frame
+                ee_pos_b, ee_quat_b = subtract_frame_transforms(
+                    root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
                 )
+                # compute the joint commands
+                joint_pos_des = diff_ik.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
 
-                grasps = []
+        
+            # apply actions
+            robot.set_joint_position_target(joint_pos_des, joint_ids=robot_entity_cfg.joint_ids)
+            env.scene.write_data_to_sim()
+            # perform step
+            env.sim.step()
+            # update sim-time
+            count += 1
+            # update buffers
+            env.scene.update(sim_dt)
 
-                if len(grasps) > 0:
-                    g0 = grasps[0]
-                    print(
-                        f"[GRASP] score={g0['score']:.3f} width={g0['width']:.3f} "
-                        f"pos={g0['pos']} quat(xyzw)={g0['quat']}"
-                    )
-
-                    # assuming 1 env
-                    g = grasps[0]
-
-                    pre_pos_w = torch.tensor(g["pregrasp"], dtype=torch.float32, device=env.device)
-                    grasp_pos_w = torch.tensor(g["pos"], dtype=torch.float32, device=env.device)
-                    lift_pos_w = grasp_pos_w + torch.tensor([0.0, 0.0, 0.10], dtype=torch.float32, device=env.device)
-                    grasp_quat_w = torch.tensor(g["quat"], dtype=torch.float32, device=env.device)
+            # obtain quantities from simulation
+            ee_pose_w = robot.data.body_state_w[:, robot_entity_cfg.body_ids[0], 0:7]
+            # update marker positions
+            ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
+            goal_marker.visualize(ik_commands[:, 0:3] + env.scene.env_origins, ik_commands[:, 3:7])
 
 
-                    diff_ik.reset()
 
-                    #run_ik_to_pose(
-                    #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
-                    #    pre_pos_w, grasp_quat_w, steps=40
-                    #)
 
-                    #run_ik_to_pose(
-                    #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
-                    #    grasp_pos_w, grasp_quat_w, steps=40
-                    #)
 
-                    # TODO: close gripper here if your action space includes gripper joints
 
-                    #run_ik_to_pose(
-                    #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
-                    #    lift_pos_w, grasp_quat_w, steps=40
-                    #)
+        #while simulation_app.is_running() and not interrupted:
+        #    # run everything in inference mode
+        #    with torch.inference_mode():
 
-                if rate_limiter:
-                    rate_limiter.sleep(env)
-            if interrupted:
-                break
+        #        #pc = rigid_object_pc(env, ['Orange001'])
+        #        #pcs.append(pc)
+
+        #        #grasps = topdown_antipodal_grasps(
+        #        #pc,
+        #        #n_candidates=30,
+        #        #sample_pairs=8000,
+        #        #    min_width=0.015,
+        #        #    max_width=0.080,
+        #        #    approach_clearance=0.08,
+        #        #    finger_depth=0.05,
+        #        #    seed=0,
+        #        #)
+
+        #        #hold_current_joints(env, robot, robot_entity_cfg, steps=40)
+
+        #        jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, robot_entity_cfg.joint_ids]
+        #        ee_pose_w = robot.data.body_pose_w[:, robot_entity_cfg.body_ids[0]]
+        #        root_pose_w = robot.data.root_pose_w
+        #        joint_pos = robot.data.joint_pos[:, robot_entity_cfg.joint_ids]
+        #        # compute frame in root frame
+        #        ee_pos_b, ee_quat_b = subtract_frame_transforms(
+        #            root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
+        #        )
+        #        # compute the joint commands
+        #        joint_pos_des = diff_ik.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
+
+        #        # apply actions
+        #        robot.set_joint_position_target(joint_pos_des, joint_ids=robot_entity_cfg.joint_ids)
+        #        scene.write_data_to_sim()
+
+        #        #diff_ik.reset()
+
+        #        #run_ik_to_pose(
+        #        #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
+        #        #    pre_pos_w, grasp_quat_w, steps=40
+        #        #)
+
+        #        grasps = []
+
+        #        if len(grasps) > 0:
+        #            g0 = grasps[0]
+        #            print(
+        #                f"[GRASP] score={g0['score']:.3f} width={g0['width']:.3f} "
+        #                f"pos={g0['pos']} quat(xyzw)={g0['quat']}"
+        #            )
+
+        #            # assuming 1 env
+        #            g = grasps[0]
+
+        #            pre_pos_w = torch.tensor(g["pregrasp"], dtype=torch.float32, device=env.device)
+        #            grasp_pos_w = torch.tensor(g["pos"], dtype=torch.float32, device=env.device)
+        #            lift_pos_w = grasp_pos_w + torch.tensor([0.0, 0.0, 0.10], dtype=torch.float32, device=env.device)
+        #            grasp_quat_w = torch.tensor(g["quat"], dtype=torch.float32, device=env.device)
+
+
+        #            diff_ik.reset()
+
+        #            #run_ik_to_pose(
+        #            #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
+        #            #    pre_pos_w, grasp_quat_w, steps=40
+        #            #)
+
+        #            #run_ik_to_pose(
+        #            #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
+        #            #    grasp_pos_w, grasp_quat_w, steps=40
+        #            #)
+
+        #            # TODO: close gripper here if your action space includes gripper joints
+
+        #            #run_ik_to_pose(
+        #            #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
+        #            #    lift_pos_w, grasp_quat_w, steps=40
+        #            #)
+
+        #        if rate_limiter:
+        #            rate_limiter.sleep(env)
+        #    if interrupted:
+        #        break
     except Exception as e:
         import traceback
 
