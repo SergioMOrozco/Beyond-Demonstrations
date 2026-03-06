@@ -94,7 +94,11 @@ from leisaac.enhance.managers import EnhanceDatasetExportMode, StreamingRecorder
 from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
 from utils.point_clouds import sample_mesh_points_global, transform_points, save_pointclouds, rigid_object_pc
 from utils.grasps import topdown_antipodal_grasps
-from utils.ik import solve_ik_frame, load_chain
+from utils.ik import solve_ik_frame, load_chain, run_ik_to_pose, hold_current_joints
+
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import subtract_frame_transforms
 
 from omni.usd import get_context
 from pxr import Usd, UsdGeom, Gf
@@ -190,130 +194,16 @@ def main():  # noqa: C901
             env_cfg.terminations.time_out = None
         if hasattr(env_cfg.terminations, "success"):
             env_cfg.terminations.success = None
-    # recorder preprocess & manual success terminate preprocess
-    if args_cli.record:
-        if args_cli.use_lerobot_recorder:
-            if args_cli.resume:
-                env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_SUCCEEDED_ONLY_RESUME
-            else:
-                env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
-        else:
-            if args_cli.resume:
-                env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_ALL_RESUME
-                assert os.path.exists(
-                    args_cli.dataset_file
-                ), "the dataset file does not exist, please don't use '--resume' if you want to record a new dataset"
-            else:
-                env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_ALL
-                assert not os.path.exists(
-                    args_cli.dataset_file
-                ), "the dataset file already exists, please use '--resume' to resume recording"
-        env_cfg.recorders.dataset_export_dir_path = output_dir
-        env_cfg.recorders.dataset_filename = output_file_name
-        if is_direct_env:
-            env_cfg.return_success_status = False
-        else:
-            if not hasattr(env_cfg.terminations, "success"):
-                setattr(env_cfg.terminations, "success", None)
-            env_cfg.terminations.success = TerminationTermCfg(
-                func=lambda env: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-            )
-    else:
-        env_cfg.recorders = None
 
     # create environment
     env: ManagerBasedRLEnv | DirectRLEnv = gym.make(task_name, cfg=env_cfg).unwrapped
-    # replace the original recorder manager with the streaming recorder manager or lerobot recorder manager
-    if args_cli.record:
-        del env.recorder_manager
-        if args_cli.use_lerobot_recorder:
-            from leisaac.enhance.datasets.lerobot_dataset_handler import (
-                LeRobotDatasetCfg,
-            )
-            from leisaac.enhance.managers.lerobot_recorder_manager import (
-                LeRobotRecorderManager,
-            )
 
-            dataset_cfg = LeRobotDatasetCfg(
-                repo_id=args_cli.lerobot_dataset_repo_id,
-                fps=args_cli.lerobot_dataset_fps,
-            )
-            env.recorder_manager = LeRobotRecorderManager(env_cfg.recorders, dataset_cfg, env)
-        else:
-            env.recorder_manager = StreamingRecorderManager(env_cfg.recorders, env)
-            env.recorder_manager.flush_steps = 100
-            env.recorder_manager.compression = "lzf"
-
-    # create controller
-    if args_cli.teleop_device == "keyboard":
-        from leisaac.devices import SO101Keyboard
-
-        teleop_interface = SO101Keyboard(env, sensitivity=args_cli.sensitivity)
-    elif args_cli.teleop_device == "gamepad":
-        from leisaac.devices import SO101Gamepad
-
-        teleop_interface = SO101Gamepad(env, sensitivity=args_cli.sensitivity)
-    elif args_cli.teleop_device == "so101leader":
-        from leisaac.devices import SO101Leader
-
-        teleop_interface = SO101Leader(env, port=args_cli.port, recalibrate=args_cli.recalibrate)
-    elif args_cli.teleop_device == "bi-so101leader":
-        from leisaac.devices import BiSO101Leader
-
-        teleop_interface = BiSO101Leader(
-            env, left_port=args_cli.left_arm_port, right_port=args_cli.right_arm_port, recalibrate=args_cli.recalibrate
-        )
-    elif args_cli.teleop_device == "lekiwi-keyboard":
-        from leisaac.devices import LeKiwiKeyboard
-
-        teleop_interface = LeKiwiKeyboard(env, sensitivity=args_cli.sensitivity)
-    elif args_cli.teleop_device == "lekiwi-leader":
-        from leisaac.devices import LeKiwiLeader
-
-        teleop_interface = LeKiwiLeader(env, port=args_cli.port, recalibrate=args_cli.recalibrate)
-    elif args_cli.teleop_device == "lekiwi-gamepad":
-        from leisaac.devices import LeKiwiGamepad
-
-        teleop_interface = LeKiwiGamepad(env, sensitivity=args_cli.sensitivity)
-    else:
-        raise ValueError(
-            f"Invalid device interface '{args_cli.teleop_device}'. Supported: 'keyboard', 'gamepad', 'so101leader',"
-            " 'bi-so101leader', 'lekiwi-keyboard', 'lekiwi-leader', 'lekiwi-gamepad'."
-        )
-
-    # add teleoperation key for env reset
-    should_reset_recording_instance = False
-
-    def reset_recording_instance():
-        nonlocal should_reset_recording_instance
-        should_reset_recording_instance = True
-
-    # add teleoperation key for task success
-    should_reset_task_success = False
-
-    def reset_task_success():
-        nonlocal should_reset_task_success
-        should_reset_task_success = True
-        reset_recording_instance()
-
-    teleop_interface.add_callback("R", reset_recording_instance)
-    teleop_interface.add_callback("N", reset_task_success)
-    teleop_interface.display_controls()
     rate_limiter = RateLimiter(args_cli.step_hz)
 
     # reset environment
     if hasattr(env, "initialize"):
         env.initialize()
     env.reset()
-    teleop_interface.reset()
-
-    resume_recorded_demo_count = 0
-    if args_cli.record and args_cli.resume:
-        resume_recorded_demo_count = env.recorder_manager._dataset_file_handler.get_num_episodes()
-        print(f"Resume recording from existing dataset file with {resume_recorded_demo_count} demonstrations.")
-    current_recorded_demo_count = resume_recorded_demo_count
-
-    start_record_state = False
 
     interrupted = False
 
@@ -329,56 +219,104 @@ def main():  # noqa: C901
 
     chain = load_chain()
 
+    robot = env.scene["robot"]
+
+    print("Robot joint names:", robot.data.joint_names)
+    print("Robot body names:", robot.data.body_names)
+
+    robot_entity_cfg = SceneEntityCfg(
+        "robot",
+        joint_names=['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll'],              # better to narrow this to arm joints only
+        body_names=['gripper'],          # <-- replace with your actual EE body name
+    )
+    robot_entity_cfg.resolve(env.scene)
+
+    if robot.is_fixed_base:
+        ee_jacobi_idx = robot_entity_cfg.body_ids[0] - 1
+    else:
+        ee_jacobi_idx = robot_entity_cfg.body_ids[0]
+
+    diff_ik_cfg = DifferentialIKControllerCfg(
+        command_type="pose",
+        use_relative_mode=False,
+        ik_method="dls",
+    )
+    diff_ik = DifferentialIKController(diff_ik_cfg, num_envs=env.num_envs, device=env.device)
+
+    print("Resolved arm joint ids:", robot_entity_cfg.joint_ids)
+    print("Resolved ee body ids:", robot_entity_cfg.body_ids)
+
+    pcs = []
+
+    ee_pose_w = robot.data.body_pose_w[:, robot_entity_cfg.body_ids[0]]
+    pre_pos_w = ee_pose_w[:, 0:3].clone()
+    grasp_quat_w = ee_pose_w[:, 3:7].clone()
+
     try:
         while simulation_app.is_running() and not interrupted:
             # run everything in inference mode
             with torch.inference_mode():
-                if env.cfg.dynamic_reset_gripper_effort_limit:
-                    dynamic_reset_gripper_effort_limit_sim(env, args_cli.teleop_device)
-                actions = teleop_interface.advance()
-                if should_reset_task_success:
-                    print("Task Success!!!")
-                    should_reset_task_success = False
-                    if args_cli.record:
-                        manual_terminate(env, True)
-                if should_reset_recording_instance:
-                    env.reset()
-                    should_reset_recording_instance = False
-                    if start_record_state:
-                        if args_cli.record:
-                            print("Stop Recording!!!")
-                        start_record_state = False
-                    if args_cli.record:
-                        manual_terminate(env, False)
-                    # print out the current demo count if it has changed
-                    if (
-                        args_cli.record
-                        and env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
-                        > current_recorded_demo_count
-                    ):
-                        current_recorded_demo_count = (
-                            env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
-                        )
-                        print(f"Recorded {current_recorded_demo_count} successful demonstrations.")
-                    if (
-                        args_cli.record
-                        and args_cli.num_demos > 0
-                        and env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
-                        >= args_cli.num_demos
-                    ):
-                        print(f"All {args_cli.num_demos} demonstrations recorded. Exiting the app.")
-                        break
 
-                elif actions is None:
-                    env.render()
-                # apply actions
-                else:
-                    if not start_record_state:
-                        if args_cli.record:
-                            print("Start Recording!!!")
-                        start_record_state = True
+                #pc = rigid_object_pc(env, ['Orange001'])
+                #pcs.append(pc)
 
-                    env.step(actions)
+                #grasps = topdown_antipodal_grasps(
+                #pc,
+                #n_candidates=30,
+                #sample_pairs=8000,
+                #    min_width=0.015,
+                #    max_width=0.080,
+                #    approach_clearance=0.08,
+                #    finger_depth=0.05,
+                #    seed=0,
+                #)
+
+                #hold_current_joints(env, robot, robot_entity_cfg, steps=40)
+
+                diff_ik.reset()
+
+                run_ik_to_pose(
+                    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
+                    pre_pos_w, grasp_quat_w, steps=40
+                )
+
+                grasps = []
+
+                if len(grasps) > 0:
+                    g0 = grasps[0]
+                    print(
+                        f"[GRASP] score={g0['score']:.3f} width={g0['width']:.3f} "
+                        f"pos={g0['pos']} quat(xyzw)={g0['quat']}"
+                    )
+
+                    # assuming 1 env
+                    g = grasps[0]
+
+                    pre_pos_w = torch.tensor(g["pregrasp"], dtype=torch.float32, device=env.device)
+                    grasp_pos_w = torch.tensor(g["pos"], dtype=torch.float32, device=env.device)
+                    lift_pos_w = grasp_pos_w + torch.tensor([0.0, 0.0, 0.10], dtype=torch.float32, device=env.device)
+                    grasp_quat_w = torch.tensor(g["quat"], dtype=torch.float32, device=env.device)
+
+
+                    diff_ik.reset()
+
+                    #run_ik_to_pose(
+                    #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
+                    #    pre_pos_w, grasp_quat_w, steps=40
+                    #)
+
+                    #run_ik_to_pose(
+                    #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
+                    #    grasp_pos_w, grasp_quat_w, steps=40
+                    #)
+
+                    # TODO: close gripper here if your action space includes gripper joints
+
+                    #run_ik_to_pose(
+                    #    env, robot, robot_entity_cfg, ee_jacobi_idx, diff_ik,
+                    #    lift_pos_w, grasp_quat_w, steps=40
+                    #)
+
                 if rate_limiter:
                     rate_limiter.sleep(env)
             if interrupted:
